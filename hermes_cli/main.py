@@ -11,6 +11,7 @@ Usage:
     hermes gateway status      # Show gateway status
     hermes gateway install     # Install gateway service
     hermes gateway uninstall   # Uninstall gateway service
+    hermes webapi              # Run the Hermes Workspace WebAPI backend
     hermes setup               # Interactive setup wizard
     hermes logout              # Clear stored authentication
     hermes status              # Show status of all components
@@ -547,6 +548,18 @@ def cmd_gateway(args):
     """Gateway management commands."""
     from hermes_cli.gateway import gateway_command
     gateway_command(args)
+
+
+def cmd_webapi(args):
+    """Run Hermes WebAPI backend for Hermes Workspace."""
+    from webapi.__main__ import main as webapi_main
+
+    if getattr(args, "host", None):
+        os.environ["HERMES_WEBAPI_HOST"] = args.host
+    if getattr(args, "port", None) is not None:
+        os.environ["HERMES_WEBAPI_PORT"] = str(args.port)
+
+    webapi_main()
 
 
 def cmd_whatsapp(args):
@@ -3146,6 +3159,18 @@ For more help on a command:
         description="Manage the messaging gateway (Telegram, Discord, WhatsApp)"
     )
     gateway_subparsers = gateway_parser.add_subparsers(dest="gateway_command")
+
+    # =========================================================================
+    # webapi command
+    # =========================================================================
+    webapi_parser = subparsers.add_parser(
+        "webapi",
+        help="Run Hermes WebAPI backend for Hermes Workspace",
+        description="Start the FastAPI backend used by Hermes Workspace"
+    )
+    webapi_parser.add_argument("--host", default=None, help="Bind host (default: HERMES_WEBAPI_HOST or 127.0.0.1)")
+    webapi_parser.add_argument("--port", type=int, default=None, help="Bind port (default: HERMES_WEBAPI_PORT or auto-select 8642/8643)")
+    webapi_parser.set_defaults(func=cmd_webapi)
     
     # gateway run (default)
     gateway_run = gateway_subparsers.add_parser("run", help="Run gateway in foreground")
