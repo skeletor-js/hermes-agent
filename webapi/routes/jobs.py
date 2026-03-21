@@ -7,11 +7,15 @@ pause, resume, trigger, update, and delete cron jobs.
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
+
+# Control chars illegal in JSON (U+0000–U+001F) except \t \n \r
+_CTRL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 from cron.jobs import (
     create_job,
@@ -80,6 +84,8 @@ def _get_job_outputs(job_id: str, limit: int = 10) -> list[dict[str, Any]]:
     for f in files[:limit]:
         try:
             content = f.read_text(encoding="utf-8", errors="replace")
+            # Strip control chars that break JSON serialisation
+            content = _CTRL_CHAR_RE.sub("", content)
             stat = f.stat()
             outputs.append({
                 "filename": f.name,
