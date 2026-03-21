@@ -12,6 +12,7 @@ Upstream `NousResearch/hermes-agent` currently does not ship that backend. The W
 - memory browsing
 - skills browsing
 - config reads and writes
+- cron job management
 
 ## Ported WebAPI commits
 
@@ -56,6 +57,15 @@ At minimum, Hermes Workspace depends on these routes behaving:
 - `GET /api/skills`
 - `GET /api/config`
 - `PATCH /api/config`
+- `GET /api/jobs`
+- `GET /api/jobs/{job_id}`
+- `GET /api/jobs/{job_id}/output`
+- `POST /api/jobs` (create)
+- `POST /api/jobs/{job_id}/pause`
+- `POST /api/jobs/{job_id}/resume`
+- `POST /api/jobs/{job_id}/run`
+- `PATCH /api/jobs/{job_id}`
+- `DELETE /api/jobs/{job_id}`
 
 ## Smoke test
 
@@ -78,6 +88,7 @@ curl http://localhost:8642/api/sessions
 curl http://localhost:8642/api/skills
 curl http://localhost:8642/api/memory
 curl http://localhost:8642/api/config
+curl http://localhost:8642/api/jobs
 ```
 
 ### Workspace manual checks

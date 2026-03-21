@@ -35,5 +35,6 @@ check "/api/sessions"
 check "/api/skills"
 check "/api/memory"
 check "/api/config"
+check "/api/jobs"
 
 echo "WebAPI smoke test passed"

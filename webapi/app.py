@@ -10,6 +10,7 @@ from webapi.routes.health import router as health_router
 from webapi.routes.memory import router as memory_router
 from webapi.routes.models import router as models_router
 from webapi.routes.sessions import router as sessions_router
+from webapi.routes.jobs import router as jobs_router
 from webapi.routes.skills import router as skills_router
 
 # Default origins cover common local dev ports (3000-3010) + any explicitly
@@ -47,6 +48,7 @@ def create_app() -> FastAPI:
     app.include_router(memory_router)
     app.include_router(skills_router)
     app.include_router(config_router)
+    app.include_router(jobs_router)
 
     return app
 
