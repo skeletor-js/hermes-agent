@@ -50,38 +50,38 @@ Do not use this skill when:
 
 ## Procedure
 
-1. Read the user's topic and determine the core situation.
-2. Infer the emotional pattern behind the topic:
-   - chaos
-   - distraction
-   - dilemma
-   - escalation
-   - contradiction
-   - failed plan
-3. Choose the meme template that best matches that pattern.
-4. Briefly explain why the template fits the topic.
-5. Generate 3 short caption options.
-6. Keep captions aligned with the structure of the chosen meme.
-7. If the user requests programmer humor, prefer themes like debugging, deployments, meetings, deadlines, code review, technical debt, and production incidents.
-8. If the user requests Turkish, write naturally in Turkish instead of translating word-for-word.
-9. Ensure the meme structure matches the template format strictly (e.g., two-line for "This is Fine", comparison labels for "Distracted Boyfriend").
-10. If multiple templates are suitable, choose the one with the clearest and most relatable structure.
+1. Read the user's topic and identify the core situation.
+2. Map the topic to the clearest meme pattern:
+   - chaos -> This is Fine
+   - distraction -> Distracted Boyfriend
+   - dilemma -> Two Buttons
+   - escalation -> Expanding Brain
+   - rejection/preference -> Drake Hotline Bling
+   - failed plan -> Gru's Plan
+   - blame/argument -> Woman Yelling at Cat
+   - strong ironic opinion -> Change My Mind
+3. Choose the simplest fitting template instead of overthinking edge cases.
+4. Briefly explain why the template fits in 1 short sentence.
+5. Generate 3 caption options only.
+6. Keep each caption short, ideally one line per field and no more than 8–12 words.
+7. Keep captions aligned with the structure of the chosen meme.
+8. Only use tone, language, or template overrides if the user explicitly provides them.
+9. If the user requests programmer humor, prefer themes like debugging, deployments, meetings, deadlines, code review, technical debt, and production incidents.
+10. If the user requests Turkish, write naturally in Turkish instead of translating word-for-word.
 
 ## Pitfalls
 
-- Do not choose templates randomly; match the structure of the joke.
+- Do not choose templates randomly; follow the pattern mapping first.
+- Do not over-explain the joke or the template choice.
 - Do not make captions too long.
-- Do not ignore the requested tone.
+- Do not ignore explicit tone, language, or template requests.
 - Do not generate hateful, abusive, or personally targeted content.
-- Do not explain the meme too much; keep output concise and usable.
-- Do not force a meme format if the topic does not fit one clearly.
+- Do not force a meme format if the topic does not fit clearly.
 
 ## Verification
-
 The output is correct if:
 - the chosen template clearly matches the topic structure
-- the explanation is brief and sensible
-- all 3 captions are short, readable, and actually meme-like
-- the tone matches the user's request
+- the explanation is one short, sensible sentence
+- all 3 captions are short, readable, and meme-like
+- the tone matches the user's request when specified
 - the result is usable as a meme draft without major rewriting
-- the meme can be directly turned into an image without additional rewriting
