@@ -392,7 +392,13 @@ def resolve_runtime_provider(
         model_cfg = _get_model_config()
         base_url = creds.get("base_url", "").rstrip("/")
         api_mode = "chat_completions"
-        if provider == "copilot":
+        if provider in ("minimax", "minimax-cn"):
+            # MiniMax providers use Anthropic-compatible endpoints and model IDs.
+            # Do not let a stale global config force chat_completions here.
+            api_mode = "anthropic_messages"
+            if base_url.rstrip("/").endswith("/v1"):
+                base_url = base_url.rstrip("/")[:-3] + "/anthropic"
+        elif provider == "copilot":
             api_mode = _copilot_runtime_api_mode(model_cfg, creds.get("api_key", ""))
         else:
             # Check explicit api_mode from model config first
@@ -403,12 +409,6 @@ def resolve_runtime_provider(
             # (e.g. https://api.minimax.io/anthropic, https://dashscope.../anthropic)
             elif base_url.rstrip("/").endswith("/anthropic"):
                 api_mode = "anthropic_messages"
-            # MiniMax providers always use Anthropic Messages API.
-            # Auto-correct stale /v1 URLs (from old .env or config) to /anthropic.
-            elif provider in ("minimax", "minimax-cn"):
-                api_mode = "anthropic_messages"
-                if base_url.rstrip("/").endswith("/v1"):
-                    base_url = base_url.rstrip("/")[:-3] + "/anthropic"
         return {
             "provider": provider,
             "api_mode": api_mode,

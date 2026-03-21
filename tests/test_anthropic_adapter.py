@@ -77,9 +77,19 @@ class TestBuildAnthropicClient:
 
     def test_custom_base_url(self):
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
-            build_anthropic_client("sk-ant-api03-x", base_url="https://custom.api.com")
+            build_anthropic_client("***", base_url="https://custom.api.com")
             kwargs = mock_sdk.Anthropic.call_args[1]
             assert kwargs["base_url"] == "https://custom.api.com"
+
+    def test_third_party_base_url_forces_api_key_auth(self):
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("sk-cp-test-token", base_url="https://api.minimax.io/anthropic")
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["base_url"] == "https://api.minimax.io/anthropic"
+            assert kwargs["api_key"] == "sk-cp-test-token"
+            assert "auth_token" not in kwargs
+            betas = kwargs["default_headers"]["anthropic-beta"]
+            assert "oauth-2025-04-20" not in betas
 
 
 class TestReadClaudeCodeCredentials:

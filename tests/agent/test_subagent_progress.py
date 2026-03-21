@@ -15,6 +15,17 @@ import threading
 import pytest
 from unittest.mock import MagicMock, patch
 
+
+class _ClosedStream:
+    def write(self, data):
+        raise ValueError("I/O operation on closed file")
+
+    def flush(self):
+        raise ValueError("I/O operation on closed file")
+
+    def isatty(self):
+        raise ValueError("I/O operation on closed file")
+
 from agent.display import KawaiiSpinner
 from tools.delegate_tool import _build_child_progress_callback
 
@@ -64,6 +75,14 @@ class TestPrintAbove:
             sys.stdout = old_stdout
         
         assert "should go to buf" in buf.getvalue()
+
+    def test_stop_tolerates_closed_stream(self):
+        """stop() should not raise if the captured stream has already closed."""
+        spinner = KawaiiSpinner("test")
+        spinner._out = _ClosedStream()
+        spinner.running = True
+        spinner.thread = MagicMock()
+        spinner.stop("done")
 
 
 # =========================================================================

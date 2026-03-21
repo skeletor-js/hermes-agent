@@ -2052,6 +2052,15 @@ class TestSafeWriter:
         writer = _SafeWriter(inner)
         writer.flush()  # should not raise
 
+    def test_isatty_catches_valueerror(self):
+        """Closed-file ValueError on isatty is treated as non-TTY."""
+        from run_agent import _SafeWriter
+        from unittest.mock import MagicMock
+        inner = MagicMock()
+        inner.isatty.side_effect = ValueError("I/O operation on closed file")
+        writer = _SafeWriter(inner)
+        assert writer.isatty() is False
+
     def test_print_survives_broken_stdout(self, monkeypatch):
         """print() through _SafeWriter doesn't crash on broken pipe."""
         import sys
@@ -2065,6 +2074,46 @@ class TestSafeWriter:
             print("this should not crash")  # would raise without _SafeWriter
         finally:
             sys.stdout = original
+
+    def test_minimax_anthropic_mode_uses_passed_api_key_not_anthropic_fallback(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("agent.anthropic_adapter.build_anthropic_client") as mock_build_client,
+            patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="sk-ant-oat01-should-not-be-used"),
+        ):
+            AIAgent(
+                model="MiniMax-M2.7",
+                api_key="sk-cp-minimax-key",
+                base_url="https://api.minimax.io/anthropic",
+                provider="minimax",
+                api_mode="anthropic_messages",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        args = mock_build_client.call_args[0]
+        assert args[0] == "sk-cp-minimax-key"
+        assert args[1] == "https://api.minimax.io/anthropic"
+
+    def test_minimax_anthropic_mode_is_not_marked_oauth(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("agent.anthropic_adapter.build_anthropic_client"),
+            patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="sk-ant-oat01-should-not-be-used"),
+        ):
+            agent = AIAgent(
+                model="MiniMax-M2.7",
+                api_key="sk-cp-minimax-key",
+                base_url="https://api.minimax.io/anthropic",
+                provider="minimax",
+                api_mode="anthropic_messages",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        assert agent._is_anthropic_oauth is False
 
     def test_installed_in_run_conversation(self, agent):
         """run_conversation installs _SafeWriter on stdio."""

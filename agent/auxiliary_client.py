@@ -503,6 +503,16 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
         base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
         model = _API_KEY_PROVIDER_AUX_MODELS.get(provider_id, "default")
         logger.debug("Auxiliary text client: %s (%s)", pconfig.name, model)
+
+        if provider_id in {"minimax", "minimax-cn"}:
+            from agent.anthropic_adapter import build_anthropic_client
+
+            normalized_base_url = base_url
+            if normalized_base_url.endswith("/v1"):
+                normalized_base_url = normalized_base_url[:-3] + "/anthropic"
+            real_client = build_anthropic_client(api_key, normalized_base_url)
+            return AnthropicAuxiliaryClient(real_client, model, api_key, normalized_base_url), model
+
         extra = {}
         if "api.kimi.com" in base_url.lower():
             extra["default_headers"] = {"User-Agent": "KimiCLI/1.0"}
@@ -926,6 +936,18 @@ def resolve_provider_client(
 
         default_model = _API_KEY_PROVIDER_AUX_MODELS.get(provider, "")
         final_model = model or default_model
+
+        if provider in {"minimax", "minimax-cn"}:
+            from agent.anthropic_adapter import build_anthropic_client
+
+            normalized_base_url = base_url
+            if normalized_base_url.endswith("/v1"):
+                normalized_base_url = normalized_base_url[:-3] + "/anthropic"
+            real_client = build_anthropic_client(api_key, normalized_base_url)
+            client = AnthropicAuxiliaryClient(real_client, final_model, api_key, normalized_base_url)
+            logger.debug("resolve_provider_client: %s (%s) via anthropic_messages", provider, final_model)
+            return (_to_async_client(client, final_model) if async_mode
+                    else (client, final_model))
 
         # Provider-specific headers
         headers = {}

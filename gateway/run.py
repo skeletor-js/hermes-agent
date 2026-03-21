@@ -2067,7 +2067,11 @@ class GatewayRunner:
                 "message": message_text[:500],
             }
             await self.hooks.emit("agent:start", hook_ctx)
-            
+
+            # Allow hooks to inject context into the agent's ephemeral prompt
+            if hook_ctx.get("inject_context"):
+                context_prompt = (context_prompt or "") + "\n\n" + hook_ctx["inject_context"]
+
             # Run the agent
             agent_result = await self._run_agent(
                 message=message_text,

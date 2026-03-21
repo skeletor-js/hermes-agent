@@ -129,13 +129,13 @@ class _SafeWriter:
     def write(self, data):
         try:
             return self._inner.write(data)
-        except OSError:
+        except (OSError, ValueError):
             return len(data) if isinstance(data, str) else 0
 
     def flush(self):
         try:
             self._inner.flush()
-        except OSError:
+        except (OSError, ValueError):
             pass
 
     def fileno(self):
@@ -144,7 +144,7 @@ class _SafeWriter:
     def isatty(self):
         try:
             return self._inner.isatty()
-        except OSError:
+        except (OSError, ValueError):
             return False
 
     def __getattr__(self, name):
@@ -681,17 +681,25 @@ class AIAgent:
 
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
-            # Alibaba/DashScope use their own API key; do not fall back to ANTHROPIC_TOKEN (Fixes #1739 401).
+            # Third-party Anthropic-compatible providers use their own API keys;
+            # do not fall back to ANTHROPIC_TOKEN for them.
             _base = (base_url or "").lower()
-            _is_alibaba_dashscope = (self.provider == "alibaba") or ("dashscope" in _base) or ("aliyuncs" in _base)
-            effective_key = (api_key or "") if _is_alibaba_dashscope else (api_key or resolve_anthropic_token() or "")
+            _uses_provider_api_key = (
+                self.provider in {"alibaba", "minimax", "minimax-cn"}
+                or ("dashscope" in _base)
+                or ("aliyuncs" in _base)
+                or ("api.minimax.io" in _base)
+                or ("api.minimaxi.com" in _base)
+            )
+            effective_key = (api_key or "") if _uses_provider_api_key else (api_key or resolve_anthropic_token() or "")
             self.api_key = effective_key
             self._anthropic_api_key = effective_key
             self._anthropic_base_url = base_url
             from agent.anthropic_adapter import _is_oauth_token as _is_oat
-            self._is_anthropic_oauth = _is_oat(effective_key)
+            _base_is_first_party_anthropic = (not _base) or ("api.anthropic.com" in _base)
+            self._is_anthropic_oauth = _is_oat(effective_key) and _base_is_first_party_anthropic
             self._anthropic_client = build_anthropic_client(effective_key, base_url)
-            # No OpenAI client needed for Anthropic mode
+
             self.client = None
             self._client_kwargs = {}
             if not self.quiet_mode:
@@ -3375,9 +3383,16 @@ class AIAgent:
     def _try_refresh_anthropic_client_credentials(self) -> bool:
         if self.api_mode != "anthropic_messages" or not hasattr(self, "_anthropic_api_key"):
             return False
-        # Alibaba/DashScope use their own API key; do not refresh from ANTHROPIC_TOKEN (Fixes #1739 401).
+        # Third-party Anthropic-compatible providers use their own API keys;
+        # do not refresh them from ANTHROPIC_TOKEN.
         _base = (getattr(self, "_anthropic_base_url", None) or "").lower()
-        if (self.provider == "alibaba") or ("dashscope" in _base) or ("aliyuncs" in _base):
+        if (
+            self.provider in {"alibaba", "minimax", "minimax-cn"}
+            or ("dashscope" in _base)
+            or ("aliyuncs" in _base)
+            or ("api.minimax.io" in _base)
+            or ("api.minimaxi.com" in _base)
+        ):
             return False
 
         try:
@@ -4019,11 +4034,17 @@ class AIAgent:
         return transformed
 
     def _anthropic_preserve_dots(self) -> bool:
-        """True when using Alibaba/DashScope anthropic-compatible endpoint (model names keep dots, e.g. qwen3.5-plus)."""
-        if (getattr(self, "provider", "") or "").lower() == "alibaba":
+        """True when using anthropic-compatible providers whose model names keep dots."""
+        provider = (getattr(self, "provider", "") or "").lower()
+        if provider in {"alibaba", "minimax", "minimax-cn"}:
             return True
         base = (getattr(self, "base_url", "") or "").lower()
-        return "dashscope" in base or "aliyuncs" in base
+        return (
+            "dashscope" in base
+            or "aliyuncs" in base
+            or "api.minimax.io" in base
+            or "api.minimaxi.com" in base
+        )
 
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""

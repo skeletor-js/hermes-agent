@@ -27,6 +27,7 @@ def _clean_env(monkeypatch):
         "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
         "OPENAI_MODEL", "LLM_MODEL", "NOUS_INFERENCE_BASE_URL",
         "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+        "MINIMAX_API_KEY", "MINIMAX_BASE_URL", "MINIMAX_CN_API_KEY", "MINIMAX_CN_BASE_URL",
         # Per-task provider/model/direct-endpoint overrides
         "AUXILIARY_VISION_PROVIDER", "AUXILIARY_VISION_MODEL",
         "AUXILIARY_VISION_BASE_URL", "AUXILIARY_VISION_API_KEY",
@@ -247,6 +248,18 @@ class TestVisionClientFallback:
         assert client is not None
         assert client.__class__.__name__ == "AnthropicAuxiliaryClient"
         assert model == "claude-haiku-4-5-20251001"
+
+    def test_resolve_provider_client_minimax_uses_anthropic_wrapper(self, monkeypatch):
+        monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-key")
+        monkeypatch.setenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
+
+        with patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()) as mock_build:
+            client, model = resolve_provider_client("minimax")
+
+        assert client is not None
+        assert client.__class__.__name__ == "AnthropicAuxiliaryClient"
+        assert model == "MiniMax-M2.7-highspeed"
+        assert mock_build.call_args[0] == ("test-minimax-key", "https://api.minimax.io/anthropic")
 
     def test_resolve_provider_client_copilot_uses_runtime_credentials(self, monkeypatch):
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)

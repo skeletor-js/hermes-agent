@@ -122,7 +122,10 @@ def build_anthropic_client(api_key: str, base_url: str = None):
     if base_url:
         kwargs["base_url"] = base_url
 
-    if _is_oauth_token(api_key):
+    base = (base_url or "").lower()
+    is_first_party_anthropic = (not base) or ("api.anthropic.com" in base)
+
+    if _is_oauth_token(api_key) and is_first_party_anthropic:
         # OAuth access token / setup-token → Bearer auth + Claude Code identity.
         # Anthropic routes OAuth requests based on user-agent and headers;
         # without Claude Code's fingerprint, requests get intermittent 500s.
@@ -134,7 +137,8 @@ def build_anthropic_client(api_key: str, base_url: str = None):
             "x-app": "cli",
         }
     else:
-        # Regular API key → x-api-key header + common betas
+        # Third-party Anthropic-compatible providers like MiniMax and DashScope
+        # use API-key auth even when their keys do not look like Anthropic keys.
         kwargs["api_key"] = api_key
         if _COMMON_BETAS:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(_COMMON_BETAS)}
@@ -659,14 +663,16 @@ def refresh_hermes_oauth_token() -> Optional[str]:
 def normalize_model_name(model: str, preserve_dots: bool = False) -> str:
     """Normalize a model name for the Anthropic API.
 
-    - Strips 'anthropic/' prefix (OpenRouter format, case-insensitive)
+    - Strips provider prefixes like 'anthropic/' and 'minimax/'
     - Converts dots to hyphens in version numbers (OpenRouter uses dots,
       Anthropic uses hyphens: claude-opus-4.6 → claude-opus-4-6), unless
-      preserve_dots is True (e.g. for Alibaba/DashScope: qwen3.5-plus).
+      preserve_dots is True (e.g. for Alibaba/DashScope or MiniMax models).
     """
     lower = model.lower()
-    if lower.startswith("anthropic/"):
-        model = model[len("anthropic/"):]
+    for prefix in ("anthropic/", "minimax/", "minimax-cn/"):
+        if lower.startswith(prefix):
+            model = model[len(prefix):]
+            break
     if not preserve_dots:
         # OpenRouter uses dots for version separators (claude-opus-4.6),
         # Anthropic uses hyphens (claude-opus-4-6). Convert dots to hyphens.

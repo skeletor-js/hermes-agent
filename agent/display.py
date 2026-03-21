@@ -257,7 +257,11 @@ class KawaiiSpinner:
         # When stdout is not a real terminal (e.g. Docker, systemd, pipe),
         # skip the animation entirely — it creates massive log bloat.
         # Just log the start once and let stop() log the completion.
-        if not hasattr(self._out, 'isatty') or not self._out.isatty():
+        try:
+            is_tty = hasattr(self._out, 'isatty') and self._out.isatty()
+        except (ValueError, OSError):
+            is_tty = False
+        if not is_tty:
             self._write(f"  [tool] {self.message}", flush=True)
             while self.running:
                 time.sleep(0.5)
@@ -329,7 +333,10 @@ class KawaiiSpinner:
         if self.thread:
             self.thread.join(timeout=0.5)
 
-        is_tty = hasattr(self._out, 'isatty') and self._out.isatty()
+        try:
+            is_tty = hasattr(self._out, 'isatty') and self._out.isatty()
+        except (ValueError, OSError):
+            is_tty = False
         if is_tty:
             # Clear the spinner line with spaces instead of \033[K to avoid
             # garbled escape codes when prompt_toolkit's patch_stdout is active.

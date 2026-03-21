@@ -487,7 +487,21 @@ class TestRuntimeProviderResolution:
         from hermes_cli.runtime_provider import resolve_runtime_provider
         result = resolve_runtime_provider(requested="minimax")
         assert result["provider"] == "minimax"
+        assert result["api_mode"] == "anthropic_messages"
         assert result["api_key"] == "mm-key"
+        assert result["base_url"].endswith("/anthropic")
+
+    def test_runtime_minimax_ignores_stale_chat_completions_config(self, monkeypatch):
+        monkeypatch.setenv("MINIMAX_API_KEY", "mm-key")
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_model_config",
+            lambda: {"api_mode": "chat_completions"},
+        )
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        result = resolve_runtime_provider(requested="minimax")
+        assert result["provider"] == "minimax"
+        assert result["api_mode"] == "anthropic_messages"
+        assert result["base_url"].endswith("/anthropic")
 
     def test_runtime_ai_gateway(self, monkeypatch):
         monkeypatch.setenv("AI_GATEWAY_API_KEY", "gw-key")
