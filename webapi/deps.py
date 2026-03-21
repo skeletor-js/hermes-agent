@@ -48,7 +48,15 @@ def get_config() -> dict[str, Any]:
 
 
 def get_runtime_model() -> str:
-    return _resolve_model()
+    resolved = _resolve_model()
+    if isinstance(resolved, dict):
+        for key in ("default", "model", "id", "name"):
+            value = resolved.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    if isinstance(resolved, str):
+        return resolved
+    return str(resolved or "")
 
 
 def get_runtime_agent_kwargs() -> dict[str, Any]:

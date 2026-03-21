@@ -1,0 +1,10 @@
+name: superbud-memory
+description: >
+  Supermemory enforcement via gateway hooks.
+  Pre-loads relevant context on agent:start (entity extraction + search + MEMORY.md injection).
+  Extracts and saves facts on agent:end (debounced, cheap LLM extraction).
+  Generates session summary on session:end.
+events:
+  - agent:start
+  - agent:end
+  - session:end
