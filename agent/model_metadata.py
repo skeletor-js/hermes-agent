@@ -164,6 +164,8 @@ _URL_TO_PROVIDER: Dict[str, str] = {
     "openrouter.ai": "openrouter",
     "inference-api.nousresearch.com": "nous",
     "api.deepseek.com": "deepseek",
+    "api.githubcopilot.com": "copilot",
+    "models.github.ai": "copilot",
 }
 
 
@@ -260,9 +262,11 @@ def detect_local_server_type(base_url: str) -> Optional[str]:
                         pass
             except Exception:
                 pass
-            # llama.cpp exposes /props
+            # llama.cpp exposes /v1/props (older builds used /props without the /v1 prefix)
             try:
-                r = client.get(f"{server_url}/props")
+                r = client.get(f"{server_url}/v1/props")
+                if r.status_code != 200:
+                    r = client.get(f"{server_url}/props")  # fallback for older builds
                 if r.status_code == 200 and "default_generation_settings" in r.text:
                     return "llamacpp"
             except Exception:
@@ -455,8 +459,11 @@ def fetch_endpoint_model_metadata(
             )
             if is_llamacpp:
                 try:
-                    props_url = candidate.rstrip("/").replace("/v1", "") + "/props"
-                    props_resp = requests.get(props_url, headers=headers, timeout=5)
+                    # Try /v1/props first (current llama.cpp); fall back to /props for older builds
+                    base = candidate.rstrip("/").replace("/v1", "")
+                    props_resp = requests.get(base + "/v1/props", headers=headers, timeout=5)
+                    if not props_resp.ok:
+                        props_resp = requests.get(base + "/props", headers=headers, timeout=5)
                     if props_resp.ok:
                         props = props_resp.json()
                         gen_settings = props.get("default_generation_settings", {})
@@ -783,8 +790,12 @@ def get_model_context_length(
         if cached is not None:
             return cached
 
-    # 2. Active endpoint metadata for explicit custom routes
-    if _is_custom_endpoint(base_url):
+    # 2. Active endpoint metadata for truly custom/unknown endpoints.
+    # Known providers (Copilot, OpenAI, Anthropic, etc.) skip this — their
+    # /models endpoint may report a provider-imposed limit (e.g. Copilot
+    # returns 128k) instead of the model's full context (400k).  models.dev
+    # has the correct per-provider values and is checked at step 5+.
+    if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url):
         endpoint_metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
         matched = endpoint_metadata.get(model)
         if not matched:

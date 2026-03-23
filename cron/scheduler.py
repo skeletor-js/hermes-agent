@@ -80,11 +80,16 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
         }
 
     if ":" in deliver:
-        platform_name, chat_id = deliver.split(":", 1)
+        platform_name, rest = deliver.split(":", 1)
+        # Check for thread_id suffix (e.g. "telegram:-1003724596514:17")
+        if ":" in rest:
+            chat_id, thread_id = rest.split(":", 1)
+        else:
+            chat_id, thread_id = rest, None
         return {
             "platform": platform_name,
             "chat_id": chat_id,
-            "thread_id": None,
+            "thread_id": thread_id,
         }
 
     platform_name = deliver
@@ -412,9 +417,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         
         result = agent.run_conversation(prompt)
         
-        final_response = result.get("final_response", "")
-        if not final_response:
-            final_response = "(No response generated)"
+        final_response = result.get("final_response", "") or ""
+        # Use a separate variable for log display; keep final_response clean
+        # for delivery logic (empty response = no delivery).
+        logged_response = final_response if final_response else "(No response generated)"
         
         output = f"""# Cron Job: {job_name}
 
@@ -428,7 +434,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
 ## Response
 
-{final_response}
+{logged_response}
 """
         
         logger.info("Job '%s' completed successfully", job_name)

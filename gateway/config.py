@@ -101,12 +101,16 @@ class SessionResetPolicy:
     mode: str = "both"  # "daily", "idle", "both", or "none"
     at_hour: int = 4  # Hour for daily reset (0-23, local time)
     idle_minutes: int = 1440  # Minutes of inactivity before reset (24 hours)
+    notify: bool = True  # Send a notification to the user when auto-reset occurs
+    notify_exclude_platforms: tuple = ("api_server", "webhook")  # Platforms that don't get reset notifications
     
     def to_dict(self) -> Dict[str, Any]:
         return {
             "mode": self.mode,
             "at_hour": self.at_hour,
             "idle_minutes": self.idle_minutes,
+            "notify": self.notify,
+            "notify_exclude_platforms": list(self.notify_exclude_platforms),
         }
     
     @classmethod
@@ -115,10 +119,14 @@ class SessionResetPolicy:
         mode = data.get("mode")
         at_hour = data.get("at_hour")
         idle_minutes = data.get("idle_minutes")
+        notify = data.get("notify")
+        exclude = data.get("notify_exclude_platforms")
         return cls(
             mode=mode if mode is not None else "both",
             at_hour=at_hour if at_hour is not None else 4,
             idle_minutes=idle_minutes if idle_minutes is not None else 1440,
+            notify=notify if notify is not None else True,
+            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
         )
 
 
@@ -515,8 +523,13 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
                 if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
                     os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(
+            "Failed to process config.yaml — falling back to .env / gateway.json values. "
+            "Check %s for syntax errors. Error: %s",
+            _home / "config.yaml",
+            e,
+        )
 
     config = GatewayConfig.from_dict(gw_data)
 
@@ -738,6 +751,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     # API Server
     api_server_enabled = os.getenv("API_SERVER_ENABLED", "").lower() in ("true", "1", "yes")
     api_server_key = os.getenv("API_SERVER_KEY", "")
+    api_server_cors_origins = os.getenv("API_SERVER_CORS_ORIGINS", "")
     api_server_port = os.getenv("API_SERVER_PORT")
     api_server_host = os.getenv("API_SERVER_HOST")
     if api_server_enabled or api_server_key:
@@ -746,6 +760,10 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         config.platforms[Platform.API_SERVER].enabled = True
         if api_server_key:
             config.platforms[Platform.API_SERVER].extra["key"] = api_server_key
+        if api_server_cors_origins:
+            origins = [origin.strip() for origin in api_server_cors_origins.split(",") if origin.strip()]
+            if origins:
+                config.platforms[Platform.API_SERVER].extra["cors_origins"] = origins
         if api_server_port:
             try:
                 config.platforms[Platform.API_SERVER].extra["port"] = int(api_server_port)
@@ -784,6 +802,5 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.default_reset_policy.at_hour = int(reset_hour)
         except ValueError:
             pass
-
 
 

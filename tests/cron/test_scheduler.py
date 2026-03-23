@@ -62,6 +62,28 @@ class TestResolveDeliveryTarget:
             "thread_id": "17585",
         }
 
+    def test_explicit_telegram_topic_target_with_thread_id(self):
+        """deliver: 'telegram:chat_id:thread_id' parses correctly."""
+        job = {
+            "deliver": "telegram:-1003724596514:17",
+        }
+        assert _resolve_delivery_target(job) == {
+            "platform": "telegram",
+            "chat_id": "-1003724596514",
+            "thread_id": "17",
+        }
+
+    def test_explicit_telegram_chat_id_without_thread_id(self):
+        """deliver: 'telegram:chat_id' sets thread_id to None."""
+        job = {
+            "deliver": "telegram:-1003724596514",
+        }
+        assert _resolve_delivery_target(job) == {
+            "platform": "telegram",
+            "chat_id": "-1003724596514",
+            "thread_id": None,
+        }
+
     def test_bare_platform_uses_matching_origin_chat(self):
         job = {
             "deliver": "telegram",
@@ -233,6 +255,47 @@ class TestRunJobSessionPersistence:
         assert kwargs["platform"] == "cron"
         assert kwargs["session_id"].startswith("cron_test-job_")
         fake_db.close.assert_called_once()
+
+    def test_run_job_empty_response_returns_empty_not_placeholder(self, tmp_path):
+        """Empty final_response should stay empty for delivery logic (issue #2234).
+        
+        The placeholder '(No response generated)' should only appear in the
+        output log, not in the returned final_response that's used for delivery.
+        """
+        job = {
+            "id": "silent-job",
+            "name": "silent test",
+            "prompt": "do work via tools only",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            # Agent did work via tools but returned no text
+            mock_agent.run_conversation.return_value = {"final_response": ""}
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        # final_response should be empty for delivery logic to skip
+        assert final_response == ""
+        # But the output log should show the placeholder
+        assert "(No response generated)" in output
 
     def test_run_job_sets_auto_delivery_env_from_dotenv_home_channel(self, tmp_path, monkeypatch):
         job = {

@@ -31,15 +31,12 @@ import json
 import logging
 import os
 import platform
-import signal
 import sys
 import time
 import threading
 import atexit
 import shutil
 import subprocess
-import tempfile
-import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -51,7 +48,7 @@ logger = logging.getLogger(__name__)
 # The terminal tool polls this during command execution so it can kill
 # long-running subprocesses immediately instead of blocking until timeout.
 # ---------------------------------------------------------------------------
-from tools.interrupt import set_interrupt as set_interrupt_event, is_interrupted, _interrupt_event
+from tools.interrupt import is_interrupted, _interrupt_event
 
 
 # Add mini-swe-agent to path if not installed. In git worktrees the populated
@@ -75,9 +72,9 @@ DISK_USAGE_WARNING_THRESHOLD_GB = float(os.getenv("TERMINAL_DISK_WARNING_GB", "5
 
 def _check_disk_usage_warning():
     """Check if total disk usage exceeds warning threshold."""
-    scratch_dir = _get_scratch_dir()
-    
     try:
+        scratch_dir = _get_scratch_dir()
+
         # Get total size of hermes directories
         total_bytes = 0
         import glob
@@ -98,6 +95,7 @@ def _check_disk_usage_warning():
         
         return False
     except Exception as e:
+        logger.debug("Disk usage warning check failed: %s", e, exc_info=True)
         return False
 
 
@@ -130,11 +128,8 @@ def set_approval_callback(cb):
 
 # Dangerous command detection + approval now consolidated in tools/approval.py
 from tools.approval import (
-    detect_dangerous_command as _detect_dangerous_command,
     check_dangerous_command as _check_dangerous_command_impl,
     check_all_command_guards as _check_all_guards_impl,
-    load_permanent_allowlist as _load_permanent_allowlist,
-    DANGEROUS_PATTERNS,
 )
 
 
@@ -1167,6 +1162,11 @@ def terminal_tool(
                     f"out of {len(output)} total] ...\n\n"
                 )
                 output = output[:head_chars] + truncated_notice + output[-tail_chars:]
+
+            # Strip ANSI escape sequences so the model never sees terminal
+            # formatting — prevents it from copying escapes into file writes.
+            from tools.ansi_strip import strip_ansi
+            output = strip_ansi(output)
 
             # Redact secrets from command output (catches env/printenv leaking keys)
             from agent.redact import redact_sensitive_text

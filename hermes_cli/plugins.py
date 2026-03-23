@@ -454,3 +454,48 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> None:
 def get_plugin_tool_names() -> Set[str]:
     """Return the set of tool names registered by plugins."""
     return get_plugin_manager()._plugin_tool_names
+
+
+def get_plugin_toolsets() -> List[tuple]:
+    """Return plugin toolsets as ``(key, label, description)`` tuples.
+
+    Used by the ``hermes tools`` TUI so plugin-provided toolsets appear
+    alongside the built-in ones and can be toggled on/off per platform.
+    """
+    manager = get_plugin_manager()
+    if not manager._plugin_tool_names:
+        return []
+
+    try:
+        from tools.registry import registry
+    except Exception:
+        return []
+
+    # Group plugin tool names by their toolset
+    toolset_tools: Dict[str, List[str]] = {}
+    toolset_plugin: Dict[str, LoadedPlugin] = {}
+    for tool_name in manager._plugin_tool_names:
+        entry = registry._tools.get(tool_name)
+        if not entry:
+            continue
+        ts = entry.toolset
+        toolset_tools.setdefault(ts, []).append(entry.name)
+
+    # Map toolsets back to the plugin that registered them
+    for _name, loaded in manager._plugins.items():
+        for tool_name in loaded.tools_registered:
+            entry = registry._tools.get(tool_name)
+            if entry and entry.toolset in toolset_tools:
+                toolset_plugin.setdefault(entry.toolset, loaded)
+
+    result = []
+    for ts_key in sorted(toolset_tools):
+        plugin = toolset_plugin.get(ts_key)
+        label = f"🔌 {ts_key.replace('_', ' ').title()}"
+        if plugin and plugin.manifest.description:
+            desc = plugin.manifest.description
+        else:
+            desc = ", ".join(sorted(toolset_tools[ts_key]))
+        result.append((ts_key, label, desc))
+
+    return result

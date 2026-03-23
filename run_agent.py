@@ -70,7 +70,7 @@ from tools.browser_tool import cleanup_browser
 
 import requests
 
-from hermes_constants import OPENROUTER_BASE_URL, OPENROUTER_MODELS_URL
+from hermes_constants import OPENROUTER_BASE_URL
 
 # Agent internals extracted to agent/ package for modularity
 from agent.prompt_builder import (
@@ -78,7 +78,7 @@ from agent.prompt_builder import (
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
 )
 from agent.model_metadata import (
-    fetch_model_metadata, get_model_context_length,
+    fetch_model_metadata,
     estimate_tokens_rough, estimate_messages_tokens_rough,
     get_next_probe_tier, parse_context_limit_from_error,
     save_context_length,
@@ -108,7 +108,7 @@ HONCHO_TOOL_NAMES = {
 
 
 class _SafeWriter:
-    """Transparent stdio wrapper that catches OSError from broken pipes.
+    """Transparent stdio wrapper that catches OSError/ValueError from broken pipes.
 
     When hermes-agent runs as a systemd service, Docker container, or headless
     daemon, the stdout/stderr pipe can become unavailable (idle timeout, buffer
@@ -117,8 +117,13 @@ class _SafeWriter:
     run_conversation() — especially via double-fault when an except handler
     also tries to print.
 
+    Additionally, when subagents run in ThreadPoolExecutor threads, the shared
+    stdout handle can close between thread teardown and cleanup, raising
+    ``ValueError: I/O operation on closed file`` instead of OSError.
+
     This wrapper delegates all writes to the underlying stream and silently
-    catches OSError. It is transparent when the wrapped stream is healthy.
+    catches both OSError and ValueError. It is transparent when the wrapped
+    stream is healthy.
     """
 
     __slots__ = ("_inner",)
@@ -473,6 +478,11 @@ class AIAgent:
         self.quiet_mode = quiet_mode
         self.ephemeral_system_prompt = ephemeral_system_prompt
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
+        # Pluggable print function — CLI replaces this with _cprint so that
+        # raw ANSI status lines are routed through prompt_toolkit's renderer
+        # instead of going directly to stdout where patch_stdout's StdoutProxy
+        # would mangle the escape sequences.  None = use builtins.print.
+        self._print_fn = None
         self.skip_context_files = skip_context_files
         self.pass_session_id = pass_session_id
         self.log_prefix_chars = log_prefix_chars
@@ -660,6 +670,9 @@ class AIAgent:
         # Internal stream callback (set during streaming TTS).
         # Initialized here so _vprint can reference it before run_conversation.
         self._stream_callback = None
+        # Deferred paragraph break flag — set after tool iterations so a
+        # single "\n\n" is prepended to the next real text delta.
+        self._stream_needs_break = False
 
         # Optional current-turn user-message override used when the API-facing
         # user message intentionally differs from the persisted transcript
@@ -681,25 +694,18 @@ class AIAgent:
 
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
-            # Third-party Anthropic-compatible providers use their own API keys;
-            # do not fall back to ANTHROPIC_TOKEN for them.
-            _base = (base_url or "").lower()
-            _uses_provider_api_key = (
-                self.provider in {"alibaba", "minimax", "minimax-cn"}
-                or ("dashscope" in _base)
-                or ("aliyuncs" in _base)
-                or ("api.minimax.io" in _base)
-                or ("api.minimaxi.com" in _base)
-            )
-            effective_key = (api_key or "") if _uses_provider_api_key else (api_key or resolve_anthropic_token() or "")
+            # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
+            # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own API key.
+            # Falling back would send Anthropic credentials to third-party endpoints (Fixes #1739, #minimax-401).
+            _is_native_anthropic = self.provider == "anthropic"
+            effective_key = (api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or "")
             self.api_key = effective_key
             self._anthropic_api_key = effective_key
             self._anthropic_base_url = base_url
             from agent.anthropic_adapter import _is_oauth_token as _is_oat
-            _base_is_first_party_anthropic = (not _base) or ("api.anthropic.com" in _base)
-            self._is_anthropic_oauth = _is_oat(effective_key) and _base_is_first_party_anthropic
+            self._is_anthropic_oauth = _is_oat(effective_key)
             self._anthropic_client = build_anthropic_client(effective_key, base_url)
-
+            # No OpenAI client needed for Anthropic mode
             self.client = None
             self._client_kwargs = {}
             if not self.quiet_mode:
@@ -743,6 +749,16 @@ class AIAgent:
                     if hasattr(_routed_client, '_default_headers') and _routed_client._default_headers:
                         client_kwargs["default_headers"] = dict(_routed_client._default_headers)
                 else:
+                    # When the user explicitly chose a non-OpenRouter provider
+                    # but no credentials were found, fail fast with a clear
+                    # message instead of silently routing through OpenRouter.
+                    _explicit = (self.provider or "").strip().lower()
+                    if _explicit and _explicit not in ("auto", "openrouter", "custom"):
+                        raise RuntimeError(
+                            f"Provider '{_explicit}' is set in config.yaml but no API key "
+                            f"was found. Set the {_explicit.upper()}_API_KEY environment "
+                            f"variable, or switch to a different provider with `hermes model`."
+                        )
                     # Final fallback: try raw OpenRouter key
                     client_kwargs = {
                         "api_key": os.getenv("OPENROUTER_API_KEY", ""),
@@ -912,7 +928,7 @@ class AIAgent:
                 pass  # Memory is optional -- don't break agent init
         
         # Honcho AI-native memory (cross-session user modeling)
-        # Reads ~/.honcho/config.json as the single source of truth.
+        # Reads $HERMES_HOME/honcho.json (instance) or ~/.honcho/config.json (global).
         self._honcho = None  # HonchoSessionManager | None
         self._honcho_session_key = honcho_session_key
         self._honcho_config = None  # HonchoClientConfig | None
@@ -1108,16 +1124,21 @@ class AIAgent:
             self.context_compressor.compression_count = 0
             self.context_compressor._context_probed = False
     
-    @staticmethod
-    def _safe_print(*args, **kwargs):
+    def _safe_print(self, *args, **kwargs):
         """Print that silently handles broken pipes / closed stdout.
 
         In headless environments (systemd, Docker, nohup) stdout may become
         unavailable mid-session.  A raw ``print()`` raises ``OSError`` which
         can crash cron jobs and lose completed work.
+
+        Internally routes through ``self._print_fn`` (default: builtin
+        ``print``) so callers such as the CLI can inject a renderer that
+        handles ANSI escape sequences properly (e.g. prompt_toolkit's
+        ``print_formatted_text(ANSI(...))``) without touching this method.
         """
         try:
-            print(*args, **kwargs)
+            fn = self._print_fn or print
+            fn(*args, **kwargs)
         except OSError:
             pass
 
@@ -1194,7 +1215,7 @@ class AIAgent:
 
     def _looks_like_codex_intermediate_ack(
         self,
-        user_message: Any,
+        user_message: str,
         assistant_content: str,
         messages: List[Dict[str, Any]],
     ) -> bool:
@@ -1251,7 +1272,7 @@ class AIAgent:
             "path",
         )
 
-        user_text = self._extract_text_from_user_content(user_message).strip().lower()
+        user_text = (user_message or "").strip().lower()
         user_targets_workspace = (
             any(marker in user_text for marker in workspace_markers)
             or "~/" in user_text
@@ -1384,9 +1405,11 @@ class AIAgent:
 
         def _run_review():
             import contextlib, os as _os
+            review_agent = None
             try:
                 with open(_os.devnull, "w") as _devnull, \
-                     contextlib.redirect_stdout(_devnull):
+                     contextlib.redirect_stdout(_devnull), \
+                     contextlib.redirect_stderr(_devnull):
                     review_agent = AIAgent(
                         model=self.model,
                         max_iterations=8,
@@ -1439,6 +1462,20 @@ class AIAgent:
 
             except Exception as e:
                 logger.debug("Background memory/skill review failed: %s", e)
+            finally:
+                # Explicitly close the OpenAI/httpx client so GC doesn't
+                # try to clean it up on a dead asyncio event loop (which
+                # produces "Event loop is closed" errors in the terminal).
+                if review_agent is not None:
+                    client = getattr(review_agent, "client", None)
+                    if client is not None:
+                        try:
+                            review_agent._close_openai_client(
+                                client, reason="bg_review_done", shared=True
+                            )
+                            review_agent.client = None
+                        except Exception:
+                            pass
 
         t = threading.Thread(target=_run_review, daemon=True, name="bg-review")
         t.start()
@@ -2425,7 +2462,6 @@ class AIAgent:
                 "Pre-call sanitizer: added %d stub tool result(s)",
                 len(missing_results),
             )
-
         return messages
 
     @staticmethod
@@ -2595,9 +2631,9 @@ class AIAgent:
 
             if role in {"user", "assistant"}:
                 content = msg.get("content", "")
+                content_text = str(content) if content is not None else ""
 
                 if role == "assistant":
-                    content_text = str(content) if content is not None else ""
                     # Replay encrypted reasoning items from previous turns
                     # so the API can maintain coherent reasoning chains.
                     codex_reasoning = msg.get("codex_reasoning_items")
@@ -2660,34 +2696,7 @@ class AIAgent:
                             })
                     continue
 
-                # User messages: preserve multipart content (text + image_url parts)
-                # for vision support. Only stringify if content is a plain string.
-                if isinstance(content, list) and any(
-                    isinstance(p, dict) and p.get("type") in {"image_url", "input_image"}
-                    for p in content
-                ):
-                    # Convert image_url parts to Responses API input_image format
-                    responses_content: List[Dict[str, Any]] = []
-                    for part in content:
-                        if not isinstance(part, dict):
-                            continue
-                        ptype = part.get("type")
-                        if ptype == "text":
-                            text_val = str(part.get("text", "") or "").strip()
-                            if text_val:
-                                responses_content.append({"type": "input_text", "text": text_val})
-                        elif ptype in {"image_url", "input_image"}:
-                            image_data = part.get("image_url", {})
-                            url = image_data.get("url", "") if isinstance(image_data, dict) else str(image_data or "")
-                            if url:
-                                responses_content.append({"type": "input_image", "image_url": url})
-                    if responses_content:
-                        items.append({"role": "user", "content": responses_content})
-                    else:
-                        items.append({"role": "user", "content": ""})
-                else:
-                    content_text = str(content) if content is not None else ""
-                    items.append({"role": role, "content": content_text})
+                items.append({"role": role, "content": content_text})
                 continue
 
             if role == "tool":
@@ -2780,18 +2789,10 @@ class AIAgent:
                 content = item.get("content", "")
                 if content is None:
                     content = ""
-                # Preserve multipart content lists (text + input_image) for vision support.
-                # Only stringify if content is not already a valid list of content parts.
-                if isinstance(content, list) and any(
-                    isinstance(p, dict) and p.get("type") in {"input_text", "input_image"}
-                    for p in content
-                ):
-                    # Keep structured content as-is for the Responses API
-                    normalized.append({"role": role, "content": content})
-                else:
-                    if not isinstance(content, str):
-                        content = str(content)
-                    normalized.append({"role": role, "content": content})
+                if not isinstance(content, str):
+                    content = str(content)
+
+                normalized.append({"role": role, "content": content})
                 continue
 
             raise ValueError(
@@ -3383,16 +3384,9 @@ class AIAgent:
     def _try_refresh_anthropic_client_credentials(self) -> bool:
         if self.api_mode != "anthropic_messages" or not hasattr(self, "_anthropic_api_key"):
             return False
-        # Third-party Anthropic-compatible providers use their own API keys;
-        # do not refresh them from ANTHROPIC_TOKEN.
-        _base = (getattr(self, "_anthropic_base_url", None) or "").lower()
-        if (
-            self.provider in {"alibaba", "minimax", "minimax-cn"}
-            or ("dashscope" in _base)
-            or ("aliyuncs" in _base)
-            or ("api.minimax.io" in _base)
-            or ("api.minimaxi.com" in _base)
-        ):
+        # Only refresh credentials for the native Anthropic provider.
+        # Other anthropic_messages providers (MiniMax, Alibaba, etc.) use their own keys.
+        if self.provider != "anthropic":
             return False
 
         try:
@@ -3496,6 +3490,13 @@ class AIAgent:
 
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
+        # If a tool iteration set the break flag, prepend a single paragraph
+        # break before the first real text delta.  This prevents the original
+        # problem (text concatenation across tool boundaries) without stacking
+        # blank lines when multiple tool iterations run back-to-back.
+        if getattr(self, "_stream_needs_break", False) and text and text.strip():
+            self._stream_needs_break = False
+            text = "\n\n" + text
         for cb in (self.stream_delta_callback, self._stream_callback):
             if cb is not None:
                 try:
@@ -3818,7 +3819,7 @@ class AIAgent:
             if fb_api_mode == "anthropic_messages":
                 # Build native Anthropic client instead of using OpenAI client
                 from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token, _is_oauth_token
-                effective_key = fb_client.api_key or resolve_anthropic_token() or ""
+                effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if fb_provider == "anthropic" else (fb_client.api_key or "")
                 self._anthropic_api_key = effective_key
                 self._anthropic_base_url = getattr(fb_client, "base_url", None)
                 self._anthropic_client = build_anthropic_client(effective_key, self._anthropic_base_url)
@@ -3854,42 +3855,6 @@ class AIAgent:
             return False
 
     # ── End provider fallback ──────────────────────────────────────────────
-
-    @staticmethod
-    def _extract_text_from_user_content(user_message: Any) -> str:
-        if isinstance(user_message, str):
-            return user_message
-        if isinstance(user_message, list):
-            text_parts: List[str] = []
-            for part in user_message:
-                if isinstance(part, str):
-                    if part.strip():
-                        text_parts.append(part.strip())
-                    continue
-                if not isinstance(part, dict):
-                    continue
-                if part.get("type") in {"text", "input_text"}:
-                    text = str(part.get("text", "") or "").strip()
-                    if text:
-                        text_parts.append(text)
-            return "\n".join(text_parts).strip()
-        return str(user_message or "")
-
-    @staticmethod
-    def _append_user_message_suffix(user_message: Any, suffix: str) -> Any:
-        if not suffix:
-            return user_message
-        if isinstance(user_message, str):
-            return user_message + suffix
-        if isinstance(user_message, list):
-            updated = list(user_message)
-            for idx, part in enumerate(updated):
-                if isinstance(part, dict) and part.get("type") in {"text", "input_text"}:
-                    text = str(part.get("text", "") or "")
-                    updated[idx] = {**part, "text": text + suffix}
-                    return updated
-            return [{"type": "text", "text": suffix.strip()}] + updated
-        return str(user_message or "") + suffix
 
     @staticmethod
     def _content_has_image_parts(content: Any) -> bool:
@@ -4034,17 +3999,11 @@ class AIAgent:
         return transformed
 
     def _anthropic_preserve_dots(self) -> bool:
-        """True when using anthropic-compatible providers whose model names keep dots."""
-        provider = (getattr(self, "provider", "") or "").lower()
-        if provider in {"alibaba", "minimax", "minimax-cn"}:
+        """True when using Alibaba/DashScope anthropic-compatible endpoint (model names keep dots, e.g. qwen3.5-plus)."""
+        if (getattr(self, "provider", "") or "").lower() == "alibaba":
             return True
         base = (getattr(self, "base_url", "") or "").lower()
-        return (
-            "dashscope" in base
-            or "aliyuncs" in base
-            or "api.minimax.io" in base
-            or "api.minimaxi.com" in base
-        )
+        return "dashscope" in base or "aliyuncs" in base
 
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
@@ -5401,7 +5360,7 @@ class AIAgent:
 
     def run_conversation(
         self,
-        user_message: Any,
+        user_message: str,
         system_message: str = None,
         conversation_history: List[Dict[str, Any]] = None,
         task_id: str = None,
@@ -5413,8 +5372,7 @@ class AIAgent:
         Run a complete conversation with tool calling until completion.
 
         Args:
-            user_message (Any): The user's message/question. Can be plain text
-                or multimodal content parts.
+            user_message (str): The user's message/question
             system_message (str): Custom system message (optional, overrides ephemeral_system_prompt if provided)
             conversation_history (List[Dict]): Previous conversation messages (optional)
             task_id (str): Unique identifier for this task to isolate VMs between concurrent tasks (optional, auto-generated if not provided)
@@ -5474,8 +5432,7 @@ class AIAgent:
 
         # Preserve the original user message (no nudge injection).
         # Honcho should receive the actual user input, not system nudges.
-        user_message_text = self._extract_text_from_user_content(user_message)
-        original_user_message = persist_user_message if persist_user_message is not None else user_message_text
+        original_user_message = persist_user_message if persist_user_message is not None else user_message
 
         # Track memory nudge trigger (turn-based, checked here).
         # Skill trigger is checked AFTER the agent loop completes, based on
@@ -5489,17 +5446,6 @@ class AIAgent:
                 _should_review_memory = True
                 self._turns_since_memory = 0
 
-        # Skill creation nudge: fires on the first user message after a long tool loop.
-        # The counter increments per API iteration in the tool loop and is checked here.
-        if (self._skill_nudge_interval > 0
-                and self._iters_since_skill >= self._skill_nudge_interval
-                and "skill_manage" in self.valid_tool_names):
-            user_message = self._append_user_message_suffix(user_message, (
-                "\n\n[System: The previous task involved many tool calls. "
-                "Save the approach as a skill if it's reusable, or update "
-                "any existing skill you used if it was wrong or incomplete.]"
-            ))
-            self._iters_since_skill = 0
         # Honcho prefetch consumption:
         # - First turn: bake into cached system prompt (stable for the session).
         # - Later turns: attach recall to the current-turn user message at
@@ -5528,8 +5474,7 @@ class AIAgent:
         self._persist_user_message_idx = current_turn_user_idx
         
         if not self.quiet_mode:
-            preview_text = self._extract_text_from_user_content(user_message)
-            self._safe_print(f"💬 Starting conversation: '{preview_text[:60]}{'...' if len(preview_text) > 60 else ''}'")
+            self._safe_print(f"💬 Starting conversation: '{user_message[:60]}{'...' if len(user_message) > 60 else ''}'")
         
         # ── System prompt (cached per session for prefix caching) ──
         # Built once on first call, reused for all subsequent calls.
@@ -5732,7 +5677,7 @@ class AIAgent:
             # inject cache_control breakpoints (system + last 3 messages) to reduce
             # input token costs by ~75% on multi-turn conversations.
             if self._use_prompt_caching:
-                api_messages = apply_anthropic_cache_control(api_messages, cache_ttl=self._cache_ttl)
+                api_messages = apply_anthropic_cache_control(api_messages, cache_ttl=self._cache_ttl, native_anthropic=(self.api_mode == 'anthropic_messages'))
 
             # Safety net: strip orphaned tool results / add stubs for missing
             # results before sending to the API.  Runs unconditionally — not
@@ -6836,6 +6781,14 @@ class AIAgent:
 
                     _msg_count_before_tools = len(messages)
                     self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                    # Signal that a paragraph break is needed before the next
+                    # streamed text.  We don't emit it immediately because
+                    # multiple consecutive tool iterations would stack up
+                    # redundant blank lines.  Instead, _fire_stream_delta()
+                    # will prepend a single "\n\n" the next time real text
+                    # arrives.
+                    self._stream_needs_break = True
 
                     # Refund the iteration if the ONLY tool(s) called were
                     # execute_code (programmatic tool calling).  These are
