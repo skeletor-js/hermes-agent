@@ -349,6 +349,10 @@ class _AnthropicCompletionsAdapter:
             elif choice_type in {"auto", "required", "none"}:
                 normalized_tool_choice = choice_type
 
+        # Detect OAuth: if the underlying client uses auth_token (Bearer)
+        # instead of api_key, we need Claude Code identity prefix
+        _is_oauth = bool(getattr(self._client, 'auth_token', None))
+
         anthropic_kwargs = build_anthropic_kwargs(
             model=model,
             messages=messages,
@@ -356,6 +360,7 @@ class _AnthropicCompletionsAdapter:
             max_tokens=max_tokens,
             reasoning_config=None,
             tool_choice=normalized_tool_choice,
+            is_oauth=_is_oauth,
         )
         if temperature is not None:
             anthropic_kwargs["temperature"] = temperature
