@@ -1756,12 +1756,24 @@ class DiscordAdapter(BasePlatformAdapter):
         """Create a thread from a user message for auto-threading.
 
         Returns the created thread object, or ``None`` on failure.
+        The thread is created with a temporary cleaned-up name; the
+        post-response hook will rename it with an LLM-generated title.
         """
-        # Build a short thread name from the message
+        import re as _re
+        # Strip @mentions and clean up for a reasonable temporary name
         content = (message.content or "").strip()
-        thread_name = content[:80] if content else "Hermes"
-        if len(content) > 80:
-            thread_name = thread_name[:77] + "..."
+        content = _re.sub(r'<@!?\d+>', '', content).strip()
+        if content:
+            thread_name = content[:80]
+            if len(content) > 80:
+                # Truncate at word boundary
+                last_space = thread_name[:77].rfind(' ')
+                if last_space > 30:
+                    thread_name = thread_name[:last_space] + "..."
+                else:
+                    thread_name = thread_name[:77] + "..."
+        else:
+            thread_name = "Hermes"
 
         try:
             thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
@@ -1769,6 +1781,83 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[%s] Auto-thread creation failed: %s", self.name, e)
             return None
+
+    @staticmethod
+    def _generate_thread_title(user_message: str, response: str) -> Optional[str]:
+        """Generate a concise thread title from the conversation.
+
+        Tries the auxiliary LLM first (fast, cheap model).  Falls back to
+        simple heuristic extraction if no LLM is available.  Returns None
+        if no meaningful title can be produced.
+        """
+        # ── Try auxiliary LLM ────────────────────────────────────────────
+        try:
+            from agent.auxiliary_client import resolve_provider_client
+            client, model = resolve_provider_client("auto")
+            if client and model:
+                # Keep the prompt tiny for speed/cost
+                prompt = (
+                    "Generate a short, descriptive thread title (max 80 chars) "
+                    "for this conversation. Return ONLY the title, no quotes or "
+                    "extra text.\n\n"
+                    f"User: {user_message[:500]}\n"
+                    f"Assistant: {response[:500]}"
+                )
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=60,
+                    temperature=0.3,
+                )
+                title = (resp.choices[0].message.content or "").strip().strip('"\'')
+                if title and len(title) <= 100:
+                    return title[:100]
+        except Exception as e:
+            logger.debug("[Discord] Auxiliary LLM thread title generation failed: %s", e)
+
+        # ── Heuristic fallback ───────────────────────────────────────────
+        # Use the first sentence or meaningful fragment from the user message
+        text = user_message.strip()
+        if not text:
+            return None
+        # Strip common noise (mentions, leading punctuation)
+        import re as _re
+        text = _re.sub(r'<@!?\d+>', '', text).strip()
+        if not text:
+            return None
+        # Take first sentence
+        for sep in ('.', '?', '!', '\n'):
+            idx = text.find(sep)
+            if 0 < idx <= 80:
+                return text[:idx + 1].strip()
+        # Just truncate intelligently at a word boundary
+        if len(text) <= 80:
+            return text
+        truncated = text[:77]
+        last_space = truncated.rfind(' ')
+        if last_space > 40:
+            return truncated[:last_space] + "..."
+        return truncated + "..."
+
+    async def _post_response_hook(self, event, response: str) -> None:
+        """Rename auto-created threads with a descriptive title."""
+        thread_channel = event.metadata.get("auto_thread_channel")
+        if thread_channel is None:
+            return
+
+        title = await asyncio.to_thread(
+            self._generate_thread_title,
+            event.text or "",
+            response or "",
+        )
+        if not title:
+            return
+
+        try:
+            await thread_channel.edit(name=title)
+            logger.info("[%s] Renamed auto-thread %s to: %s", self.name, thread_channel.id, title)
+        except Exception as e:
+            logger.warning("[%s] Failed to rename auto-thread: %s", self.name, e)
 
     async def send_exec_approval(
         self, chat_id: str, command: str, approval_id: str
@@ -2106,6 +2195,10 @@ class DiscordAdapter(BasePlatformAdapter):
             reply_to_message_id=str(message.reference.message_id) if message.reference else None,
             timestamp=message.created_at,
         )
+
+        # Tag auto-threaded events so _post_response_hook can rename the thread
+        if auto_threaded_channel is not None:
+            event.metadata["auto_thread_channel"] = auto_threaded_channel
 
         # Track thread participation so the bot won't require @mention for
         # follow-up messages in threads it has already engaged in.

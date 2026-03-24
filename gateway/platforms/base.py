@@ -299,6 +299,9 @@ class MessageEvent:
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     
+    # Adapter-specific metadata (e.g., auto_thread_channel for Discord)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
         return self.text.startswith("/")
@@ -819,6 +822,15 @@ class BasePlatformAdapter(ABC):
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
+
+    async def _post_response_hook(self, event: MessageEvent, response: str) -> None:
+        """Called after the agent response is sent. Override in subclasses.
+
+        Use cases: Discord auto-thread renaming, analytics, etc.
+        Exceptions are caught and logged by the caller -- implementations
+        should not worry about breaking the response flow.
+        """
+        pass
     
     async def handle_message(self, event: MessageEvent) -> None:
         """
@@ -1086,6 +1098,13 @@ class BasePlatformAdapter(ABC):
                             )
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+
+            # Post-response hook (e.g., Discord thread renaming)
+            if response:
+                try:
+                    await self._post_response_hook(event, response)
+                except Exception as hook_err:
+                    logger.warning("[%s] Post-response hook error: %s", self.name, hook_err)
 
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:
