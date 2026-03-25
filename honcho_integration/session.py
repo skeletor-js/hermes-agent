@@ -159,12 +159,14 @@ class HonchoSessionManager:
 
         session = self.honcho.session(session_id)
 
-        # Configure peer observation settings.
-        # observe_me=True for AI peer so Honcho watches what the agent says
-        # and builds its representation over time — enabling identity formation.
+        # Configure peer observation settings per Honcho dual-peer architecture.
+        # User peer: observe_me=True so Honcho learns preferences, goals, style.
+        # AI peer: observe_me=True so Honcho builds a representation of the
+        #   assistant's knowledge and behavior (self-awareness across sessions).
+        # observe_others=False on both to avoid cross-attributed reasoning noise.
         from honcho.session import SessionPeerConfig
-        user_config = SessionPeerConfig(observe_me=True, observe_others=True)
-        ai_config = SessionPeerConfig(observe_me=True, observe_others=True)
+        user_config = SessionPeerConfig(observe_me=True, observe_others=False)
+        ai_config = SessionPeerConfig(observe_me=True, observe_others=False)
 
         session.add_peers([(user_peer, user_config), (assistant_peer, ai_config)])
 
@@ -729,6 +731,11 @@ class HonchoSessionManager:
         assistant_peer = self._get_or_create_peer(session.assistant_peer_id)
 
         uploaded = False
+        # Only migrate user-facing memory files. SOUL.md is a static persona
+        # config — uploading it as conversation data causes Honcho's reasoning
+        # engine to draw conclusions from it (e.g. fabricating pricing tiers
+        # from hypothetical examples). Seed AI identity explicitly via
+        # `hermes honcho identity` when needed.
         files = [
             (
                 "MEMORY.md",
@@ -743,13 +750,6 @@ class HonchoSessionManager:
                 "User profile and preferences",
                 user_peer,
                 "user",
-            ),
-            (
-                "SOUL.md",
-                "agent_soul.md",
-                "Agent persona and identity configuration",
-                assistant_peer,
-                "ai",
             ),
         ]
 
