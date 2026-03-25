@@ -321,9 +321,15 @@ class DockerEnvironment(BaseEnvironment):
         self._docker_exe = find_docker() or "docker"
 
         # Start the container directly via `docker run -d`.
+        # --rm: auto-remove the container when it stops, preventing orphaned
+        # stopped containers if cleanup fails or the parent process crashes.
+        # --stop-timeout=2: these are ephemeral compute containers with nothing
+        # to gracefully shut down; no need for the default 10s SIGTERM grace.
         container_name = f"hermes-{uuid.uuid4().hex[:8]}"
         run_cmd = [
             self._docker_exe, "run", "-d",
+            "--rm",
+            "--stop-timeout", "2",
             "--name", container_name,
             "-w", cwd,
             *all_run_args,
@@ -467,26 +473,44 @@ class DockerEnvironment(BaseEnvironment):
     def cleanup(self):
         """Stop and remove the container. Bind-mount dirs persist if persistent=True."""
         if self._container_id:
-            try:
-                # Stop in background so cleanup doesn't block
-                stop_cmd = (
-                    f"(timeout 60 {self._docker_exe} stop {self._container_id} || "
-                    f"{self._docker_exe} rm -f {self._container_id}) >/dev/null 2>&1 &"
-                )
-                subprocess.Popen(stop_cmd, shell=True)
-            except Exception as e:
-                logger.warning("Failed to stop container %s: %s", self._container_id, e)
+            cid = self._container_id
+            self._container_id = None  # prevent double-cleanup
 
-            if not self._persistent:
-                # Also schedule removal (stop only leaves it as stopped)
+            try:
+                # Synchronous stop with short timeout. The container was created
+                # with --stop-timeout=2 and --rm, so `docker stop` sends SIGTERM,
+                # waits 2s, then SIGKILL, and Docker auto-removes the container.
+                # We give the whole subprocess 15s to account for Docker daemon
+                # latency. This replaces the old fire-and-forget Popen approach
+                # that left orphaned containers when the parent process exited
+                # before the background shell completed.
+                subprocess.run(
+                    [self._docker_exe, "stop", cid],
+                    capture_output=True,
+                    timeout=15,
+                )
+            except subprocess.TimeoutExpired:
+                # Stop timed out -- force kill as fallback
+                logger.warning("docker stop timed out for %s, force removing", cid)
                 try:
-                    subprocess.Popen(
-                        f"sleep 3 && {self._docker_exe} rm -f {self._container_id} >/dev/null 2>&1 &",
-                        shell=True,
+                    subprocess.run(
+                        [self._docker_exe, "rm", "-f", cid],
+                        capture_output=True,
+                        timeout=10,
                     )
                 except Exception:
                     pass
-            self._container_id = None
+            except Exception as e:
+                logger.warning("Failed to stop container %s: %s", cid, e)
+                # Last resort: try rm -f
+                try:
+                    subprocess.run(
+                        [self._docker_exe, "rm", "-f", cid],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
 
         if not self._persistent:
             for d in (self._workspace_dir, self._home_dir):

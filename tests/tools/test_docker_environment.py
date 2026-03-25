@@ -201,15 +201,9 @@ def test_auto_mount_replaces_persistent_workspace_bind(monkeypatch, tmp_path):
 
 
 def test_non_persistent_cleanup_removes_container(monkeypatch):
-    """When persistent=false, cleanup() must schedule docker stop + rm."""
+    """When persistent=false, cleanup() must synchronously docker stop the container."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     calls = _mock_subprocess_run(monkeypatch)
-
-    popen_cmds = []
-    monkeypatch.setattr(
-        docker_env.subprocess, "Popen",
-        lambda cmd, **kw: (popen_cmds.append(cmd), type("P", (), {"poll": lambda s: 0, "wait": lambda s, **k: None, "returncode": 0, "stdout": iter([]), "stdin": None})())[1],
-    )
 
     env = _make_dummy_env(persistent_filesystem=False, task_id="ephemeral-task")
     assert env._container_id
@@ -217,9 +211,11 @@ def test_non_persistent_cleanup_removes_container(monkeypatch):
 
     env.cleanup()
 
-    # Should have stop and rm calls via Popen
-    stop_cmds = [c for c in popen_cmds if container_id in str(c) and "stop" in str(c)]
-    assert len(stop_cmds) >= 1, f"cleanup() should schedule docker stop for {container_id}"
+    # Should have a synchronous docker stop call (via subprocess.run, not Popen)
+    stop_calls = [c for c in calls if isinstance(c[0], list) and "stop" in c[0] and container_id in c[0]]
+    assert len(stop_calls) >= 1, f"cleanup() should call docker stop for {container_id}"
+    # Container ID should be cleared
+    assert env._container_id is None
 
 
 class _FakePopen:
