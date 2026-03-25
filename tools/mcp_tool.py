@@ -89,6 +89,12 @@ logger = logging.getLogger(__name__)
 _MCP_AVAILABLE = False
 _MCP_HTTP_AVAILABLE = False
 _MCP_SAMPLING_TYPES = False
+_TRANSPORT_ERRORS: tuple = ()  # populated below if anyio is available
+try:
+    from anyio import ClosedResourceError, BrokenResourceError
+    _TRANSPORT_ERRORS = (ClosedResourceError, BrokenResourceError)
+except ImportError:
+    pass
 try:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
@@ -98,6 +104,12 @@ try:
         _MCP_HTTP_AVAILABLE = True
     except ImportError:
         _MCP_HTTP_AVAILABLE = False
+    _MCP_SSE_AVAILABLE = False
+    try:
+        from mcp.client.sse import sse_client
+        _MCP_SSE_AVAILABLE = True
+    except ImportError:
+        pass
     # Sampling types -- separated so older SDK versions don't break MCP support
     try:
         from mcp.types import (
@@ -740,7 +752,14 @@ class MCPServerTask:
                 await self._shutdown_event.wait()
 
     async def _run_http(self, config: dict):
-        """Run the server using HTTP/StreamableHTTP transport."""
+        """Run the server using HTTP/StreamableHTTP or SSE transport."""
+        transport = config.get("transport", "").lower().strip()
+
+        # If transport is explicitly "sse", use SSE client
+        if transport == "sse":
+            await self._run_sse(config)
+            return
+
         if not _MCP_HTTP_AVAILABLE:
             raise ImportError(
                 f"MCP server '{self.name}' requires HTTP transport but "
@@ -771,6 +790,31 @@ class MCPServerTask:
         async with streamablehttp_client(url, **_http_kwargs) as (
             read_stream, write_stream, _get_session_id,
         ):
+            async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
+                await session.initialize()
+                self.session = session
+                await self._discover_tools()
+                self._ready.set()
+                await self._shutdown_event.wait()
+
+    async def _run_sse(self, config: dict):
+        """Run the server using legacy SSE transport."""
+        if not _MCP_SSE_AVAILABLE:
+            raise ImportError(
+                f"MCP server '{self.name}' requires SSE transport but "
+                "mcp.client.sse is not available."
+            )
+
+        url = config["url"]
+        headers = dict(config.get("headers") or {})
+        connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
+        sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
+
+        async with sse_client(
+            url=url,
+            headers=headers,
+            timeout=float(connect_timeout),
+        ) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                 await session.initialize()
                 self.session = session
@@ -999,6 +1043,84 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
 
 
 # ---------------------------------------------------------------------------
+# Transport-error detection and automatic reconnection
+# ---------------------------------------------------------------------------
+
+def _is_transport_error(exc: BaseException) -> bool:
+    """Return True if *exc* indicates a dead SSE/HTTP transport.
+
+    These errors mean the underlying connection is gone and the session
+    cannot be used.  The reconnect logic should kick in.
+    """
+    if _TRANSPORT_ERRORS and isinstance(exc, _TRANSPORT_ERRORS):
+        return True
+    # Also catch common string patterns from httpx/httpcore that
+    # surface when the SSE stream dies unexpectedly.
+    msg = str(exc).lower()
+    for pattern in ("closed", "broken", "connection reset", "remotedisconnected"):
+        if pattern in msg:
+            return True
+    return False
+
+
+def _reconnect_server(server_name: str) -> bool:
+    """Tear down a dead MCP server task and reconnect.
+
+    Returns True if reconnection succeeded, False otherwise.
+    This is a SYNC function meant to be called from handler threads.
+    It schedules the async work on the MCP event loop.
+    """
+    with _lock:
+        server = _servers.get(server_name)
+        loop = _mcp_loop
+    if not server or not loop or not loop.is_running():
+        return False
+
+    config = server._config
+    if not config:
+        logger.warning(
+            "MCP server '%s': no saved config, cannot reconnect", server_name,
+        )
+        return False
+
+    async def _do_reconnect():
+        # Shut down the old task cleanly
+        try:
+            await server.shutdown()
+        except Exception as e:
+            logger.debug("MCP server '%s' shutdown during reconnect: %s", server_name, e)
+
+        # Create and start a fresh task
+        new_server = MCPServerTask(server_name)
+        try:
+            connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
+            await asyncio.wait_for(new_server.start(config), timeout=connect_timeout)
+        except Exception as e:
+            logger.warning(
+                "MCP server '%s' reconnect failed: %s", server_name, e,
+            )
+            return False
+
+        with _lock:
+            _servers[server_name] = new_server
+        logger.info(
+            "MCP server '%s' reconnected successfully (%d tools)",
+            server_name, len(new_server._tools),
+        )
+        return True
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(_do_reconnect(), loop)
+        return future.result(timeout=_DEFAULT_CONNECT_TIMEOUT + 10)
+    except Exception as exc:
+        logger.error(
+            "MCP server '%s' reconnect scheduling failed: %s",
+            server_name, exc,
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Handler / check-fn factories
 # ---------------------------------------------------------------------------
 
@@ -1007,9 +1129,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
     The handler conforms to the registry's dispatch interface:
     ``handler(args_dict, **kwargs) -> str``
+
+    On transport-level errors (dead SSE stream, closed connection), the
+    handler will attempt to reconnect the server and retry the call once.
     """
 
-    def _handler(args: dict, **kwargs) -> str:
+    def _do_call(args: dict) -> str:
         with _lock:
             server = _servers.get(server_name)
         if not server or not server.session:
@@ -1038,9 +1163,30 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     parts.append(block.text)
             return json.dumps({"result": "\n".join(parts) if parts else ""})
 
+        return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+
+    def _handler(args: dict, **kwargs) -> str:
         try:
-            return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+            return _do_call(args)
         except Exception as exc:
+            if _is_transport_error(exc):
+                logger.warning(
+                    "MCP tool %s/%s transport error, attempting reconnect: %s",
+                    server_name, tool_name, exc,
+                )
+                if _reconnect_server(server_name):
+                    try:
+                        return _do_call(args)
+                    except Exception as retry_exc:
+                        logger.error(
+                            "MCP tool %s/%s retry after reconnect failed: %s",
+                            server_name, tool_name, retry_exc,
+                        )
+                        return json.dumps({
+                            "error": _sanitize_error(
+                                f"MCP call failed after reconnect: {type(retry_exc).__name__}: {retry_exc}"
+                            )
+                        })
             logger.error(
                 "MCP tool %s/%s call failed: %s",
                 server_name, tool_name, exc,
@@ -1057,7 +1203,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 def _make_list_resources_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists resources from an MCP server."""
 
-    def _handler(args: dict, **kwargs) -> str:
+    def _do_call(args: dict) -> str:
         with _lock:
             server = _servers.get(server_name)
         if not server or not server.session:
@@ -1081,9 +1227,30 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
                 resources.append(entry)
             return json.dumps({"resources": resources})
 
+        return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+
+    def _handler(args: dict, **kwargs) -> str:
         try:
-            return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+            return _do_call(args)
         except Exception as exc:
+            if _is_transport_error(exc):
+                logger.warning(
+                    "MCP %s/list_resources transport error, attempting reconnect: %s",
+                    server_name, exc,
+                )
+                if _reconnect_server(server_name):
+                    try:
+                        return _do_call(args)
+                    except Exception as retry_exc:
+                        logger.error(
+                            "MCP %s/list_resources retry after reconnect failed: %s",
+                            server_name, retry_exc,
+                        )
+                        return json.dumps({
+                            "error": _sanitize_error(
+                                f"MCP call failed after reconnect: {type(retry_exc).__name__}: {retry_exc}"
+                            )
+                        })
             logger.error(
                 "MCP %s/list_resources failed: %s", server_name, exc,
             )
@@ -1099,7 +1266,7 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
 def _make_read_resource_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that reads a resource by URI from an MCP server."""
 
-    def _handler(args: dict, **kwargs) -> str:
+    def _do_call(args: dict) -> str:
         with _lock:
             server = _servers.get(server_name)
         if not server or not server.session:
@@ -1123,9 +1290,30 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
                     parts.append(f"[binary data, {len(block.blob)} bytes]")
             return json.dumps({"result": "\n".join(parts) if parts else ""})
 
+        return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+
+    def _handler(args: dict, **kwargs) -> str:
         try:
-            return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+            return _do_call(args)
         except Exception as exc:
+            if _is_transport_error(exc):
+                logger.warning(
+                    "MCP %s/read_resource transport error, attempting reconnect: %s",
+                    server_name, exc,
+                )
+                if _reconnect_server(server_name):
+                    try:
+                        return _do_call(args)
+                    except Exception as retry_exc:
+                        logger.error(
+                            "MCP %s/read_resource retry after reconnect failed: %s",
+                            server_name, retry_exc,
+                        )
+                        return json.dumps({
+                            "error": _sanitize_error(
+                                f"MCP call failed after reconnect: {type(retry_exc).__name__}: {retry_exc}"
+                            )
+                        })
             logger.error(
                 "MCP %s/read_resource failed: %s", server_name, exc,
             )
@@ -1141,7 +1329,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
 def _make_list_prompts_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists prompts from an MCP server."""
 
-    def _handler(args: dict, **kwargs) -> str:
+    def _do_call(args: dict) -> str:
         with _lock:
             server = _servers.get(server_name)
         if not server or not server.session:
@@ -1170,9 +1358,30 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
                 prompts.append(entry)
             return json.dumps({"prompts": prompts})
 
+        return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+
+    def _handler(args: dict, **kwargs) -> str:
         try:
-            return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+            return _do_call(args)
         except Exception as exc:
+            if _is_transport_error(exc):
+                logger.warning(
+                    "MCP %s/list_prompts transport error, attempting reconnect: %s",
+                    server_name, exc,
+                )
+                if _reconnect_server(server_name):
+                    try:
+                        return _do_call(args)
+                    except Exception as retry_exc:
+                        logger.error(
+                            "MCP %s/list_prompts retry after reconnect failed: %s",
+                            server_name, retry_exc,
+                        )
+                        return json.dumps({
+                            "error": _sanitize_error(
+                                f"MCP call failed after reconnect: {type(retry_exc).__name__}: {retry_exc}"
+                            )
+                        })
             logger.error(
                 "MCP %s/list_prompts failed: %s", server_name, exc,
             )
@@ -1188,7 +1397,7 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
 def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that gets a prompt by name from an MCP server."""
 
-    def _handler(args: dict, **kwargs) -> str:
+    def _do_call(args: dict) -> str:
         with _lock:
             server = _servers.get(server_name)
         if not server or not server.session:
@@ -1223,9 +1432,30 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
                 resp["description"] = result.description
             return json.dumps(resp)
 
+        return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+
+    def _handler(args: dict, **kwargs) -> str:
         try:
-            return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+            return _do_call(args)
         except Exception as exc:
+            if _is_transport_error(exc):
+                logger.warning(
+                    "MCP %s/get_prompt transport error, attempting reconnect: %s",
+                    server_name, exc,
+                )
+                if _reconnect_server(server_name):
+                    try:
+                        return _do_call(args)
+                    except Exception as retry_exc:
+                        logger.error(
+                            "MCP %s/get_prompt retry after reconnect failed: %s",
+                            server_name, retry_exc,
+                        )
+                        return json.dumps({
+                            "error": _sanitize_error(
+                                f"MCP call failed after reconnect: {type(retry_exc).__name__}: {retry_exc}"
+                            )
+                        })
             logger.error(
                 "MCP %s/get_prompt failed: %s", server_name, exc,
             )
