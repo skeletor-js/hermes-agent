@@ -269,6 +269,22 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
     for item in unavailable_toolsets:
         disabled_tools.update(item.get("tools", []))
 
+    # Honcho tools appear unavailable at banner time because the session
+    # context hasn't been set yet (agent init happens later, on first
+    # message).  If Honcho is explicitly configured, treat its tools as
+    # available so the banner doesn't show them in red.
+    try:
+        from honcho_integration.client import HonchoClientConfig
+        _hcfg = HonchoClientConfig.from_global_config()
+        if _hcfg.enabled and _hcfg.api_key and _hcfg.explicitly_configured:
+            honcho_tool_names = set()
+            for item in unavailable_toolsets:
+                if item.get("name") == "honcho":
+                    honcho_tool_names.update(item.get("tools", []))
+            disabled_tools -= honcho_tool_names
+    except Exception:
+        pass  # Never break the banner over a Honcho check
+
     layout_table = Table.grid(padding=(0, 2))
     layout_table.add_column("left", justify="center")
     layout_table.add_column("right", justify="left")
