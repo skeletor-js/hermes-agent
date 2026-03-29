@@ -1266,9 +1266,34 @@ class SessionDB:
                 )
             session_ids = [row["id"] for row in cursor.fetchall()]
 
-            for sid in session_ids:
-                conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
-                conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
-            return len(session_ids)
+            # Delete in dependency order: child sessions first, then parents.
+            # Sessions with parent_session_id FK can block parent deletion.
+            all_sids = set(session_ids)
+            # Also collect orphaned children of sessions being pruned
+            placeholders = ",".join("?" for _ in session_ids)
+            if session_ids:
+                child_cursor = conn.execute(
+                    f"SELECT id FROM sessions WHERE parent_session_id IN ({placeholders})",
+                    session_ids,
+                )
+                for row in child_cursor.fetchall():
+                    all_sids.add(row["id"])
+
+            # Topological delete: children before parents
+            deleted = set()
+            max_passes = 5
+            for _ in range(max_passes):
+                progress = False
+                for sid in list(all_sids - deleted):
+                    try:
+                        conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+                        conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+                        deleted.add(sid)
+                        progress = True
+                    except Exception:
+                        continue  # blocked by FK, retry next pass
+                if not progress or deleted == all_sids:
+                    break
+            return len(deleted)
 
         return self._execute_write(_do)
