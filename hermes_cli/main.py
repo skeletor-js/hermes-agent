@@ -1050,10 +1050,6 @@ def _model_flow_openrouter(config, current_model=""):
 
     selected = _prompt_model_selection(openrouter_models, current_model=current_model)
     if selected:
-        # Clear any custom endpoint and set provider to openrouter
-        if get_env_value("OPENAI_BASE_URL"):
-            save_env_value("OPENAI_BASE_URL", "")
-            save_env_value("OPENAI_API_KEY", "")
         _save_model_choice(selected)
 
         # Update config provider and deactivate any OAuth provider
@@ -1143,10 +1139,6 @@ def _model_flow_nous(config, current_model=""):
         # Reactivate Nous as the provider and update config
         inference_url = creds.get("base_url", "")
         _update_config_for_provider("nous", inference_url)
-        # Clear any custom endpoint that might conflict
-        if get_env_value("OPENAI_BASE_URL"):
-            save_env_value("OPENAI_BASE_URL", "")
-            save_env_value("OPENAI_API_KEY", "")
         print(f"Default model set to: {selected} (via Nous Portal)")
     else:
         print("No change.")
@@ -1191,10 +1183,6 @@ def _model_flow_openai_codex(config, current_model=""):
     if selected:
         _save_model_choice(selected)
         _update_config_for_provider("openai-codex", DEFAULT_CODEX_BASE_URL)
-        # Clear custom endpoint env vars that would otherwise override Codex.
-        if get_env_value("OPENAI_BASE_URL"):
-            save_env_value("OPENAI_BASE_URL", "")
-            save_env_value("OPENAI_API_KEY", "")
         print(f"Default model set to: {selected} (via OpenAI Codex)")
     else:
         print("No change.")
@@ -1274,11 +1262,6 @@ def _model_flow_custom(config):
         )
         if probe.get("suggested_base_url"):
             print(f"  If this server expects /v1, try base URL: {probe['suggested_base_url']}")
-
-    if base_url:
-        save_env_value("OPENAI_BASE_URL", effective_url)
-    if api_key:
-        save_env_value("OPENAI_API_KEY", api_key)
 
     if model_name:
         _save_model_choice(model_name)
@@ -1439,9 +1422,6 @@ def _model_flow_named_custom(config, provider_info):
 
     # If a model is saved, just activate immediately — no probing needed
     if saved_model:
-        save_env_value("OPENAI_BASE_URL", base_url)
-        if api_key:
-            save_env_value("OPENAI_API_KEY", api_key)
         _save_model_choice(saved_model)
 
         cfg = load_config()
@@ -1513,9 +1493,6 @@ def _model_flow_named_custom(config, provider_info):
             return
 
     # Activate and save the model to the custom_providers entry
-    save_env_value("OPENAI_BASE_URL", base_url)
-    if api_key:
-        save_env_value("OPENAI_API_KEY", api_key)
     _save_model_choice(model_name)
 
     cfg = load_config()
@@ -1829,11 +1806,6 @@ def _model_flow_copilot(config, current_model=""):
             catalog=catalog,
             api_key=api_key,
         ) or selected
-        # Clear stale custom-endpoint overrides so the Copilot provider wins cleanly.
-        if get_env_value("OPENAI_BASE_URL"):
-            save_env_value("OPENAI_BASE_URL", "")
-            save_env_value("OPENAI_API_KEY", "")
-
         initial_cfg = load_config()
         current_effort = _current_reasoning_effort(initial_cfg)
         reasoning_efforts = github_model_reasoning_efforts(
@@ -2058,11 +2030,6 @@ def _model_flow_kimi(config, current_model=""):
             selected = None
 
     if selected:
-        # Clear custom endpoint if set (avoid confusion)
-        if get_env_value("OPENAI_BASE_URL"):
-            save_env_value("OPENAI_BASE_URL", "")
-            save_env_value("OPENAI_API_KEY", "")
-
         _save_model_choice(selected)
 
         # Update config with provider and base URL
@@ -2165,11 +2132,6 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
             selected = None
 
     if selected:
-        # Clear custom endpoint if set (avoid confusion)
-        if get_env_value("OPENAI_BASE_URL"):
-            save_env_value("OPENAI_BASE_URL", "")
-            save_env_value("OPENAI_API_KEY", "")
-
         _save_model_choice(selected)
 
         # Update config with provider and base URL
@@ -2381,11 +2343,6 @@ def _model_flow_anthropic(config, current_model=""):
             selected = None
 
     if selected:
-        # Clear custom endpoint if set
-        if get_env_value("OPENAI_BASE_URL"):
-            save_env_value("OPENAI_BASE_URL", "")
-            save_env_value("OPENAI_API_KEY", "")
-
         _save_model_choice(selected)
 
         # Update config with provider — clear base_url since
@@ -2467,10 +2424,14 @@ def cmd_version(args):
     # Show update status (synchronous — acceptable since user asked for version info)
     try:
         from hermes_cli.banner import check_for_updates
+        from hermes_cli.config import recommended_update_command
         behind = check_for_updates()
         if behind and behind > 0:
             commits_word = "commit" if behind == 1 else "commits"
-            print(f"Update available: {behind} {commits_word} behind — run 'hermes update'")
+            print(
+                f"Update available: {behind} {commits_word} behind — "
+                f"run '{recommended_update_command()}'"
+            )
         elif behind == 0:
             print("Up to date")
     except Exception:
@@ -2821,6 +2782,11 @@ def _invalidate_update_cache():
 def cmd_update(args):
     """Update Hermes Agent to the latest version."""
     import shutil
+    from hermes_cli.config import is_managed, managed_error
+
+    if is_managed():
+        managed_error("update Hermes Agent")
+        return
     
     print("⚕ Updating Hermes Agent...")
     print()
@@ -3156,6 +3122,7 @@ def cmd_update(args):
             _gw_service_name = get_service_name()
             existing_pid = get_running_pid()
             has_systemd_service = False
+            has_system_service = False
             has_launchd_service = False
 
             try:
@@ -3167,6 +3134,19 @@ def cmd_update(args):
                 has_systemd_service = check.stdout.strip() == "active"
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 pass
+
+            # Also check for a system-level service (hermes gateway install --system).
+            # This covers gateways running under system systemd where --user
+            # fails due to missing D-Bus session.
+            if not has_systemd_service and is_linux():
+                try:
+                    check = subprocess.run(
+                        ["systemctl", "is-active", _gw_service_name],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    has_system_service = check.stdout.strip() == "active"
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
 
             # Check for macOS launchd service
             if is_macos():
@@ -3182,7 +3162,7 @@ def cmd_update(args):
                 except (FileNotFoundError, subprocess.TimeoutExpired):
                     pass
 
-            if existing_pid or has_systemd_service or has_launchd_service:
+            if existing_pid or has_systemd_service or has_system_service or has_launchd_service:
                 print()
 
                 # When a service manager is handling the gateway, let it
@@ -3223,6 +3203,21 @@ def cmd_update(args):
                                 print("    hermes gateway restart")
                             else:
                                 print("  Try manually: hermes gateway restart")
+                elif has_system_service:
+                    # System-level service (hermes gateway install --system).
+                    # No D-Bus session needed — systemctl without --user talks
+                    # directly to the system manager over /run/systemd/private.
+                    print("→ Restarting system gateway service...")
+                    restart = subprocess.run(
+                        ["systemctl", "restart", _gw_service_name],
+                        capture_output=True, text=True, timeout=15,
+                    )
+                    if restart.returncode == 0:
+                        print("✓ Gateway restarted (system service).")
+                    else:
+                        print(f"⚠ Gateway restart failed: {restart.stderr.strip()}")
+                        print("  System services may require root.  Try:")
+                        print(f"    sudo systemctl restart {_gw_service_name}")
                 elif has_launchd_service:
                     # Refresh the plist first (picks up --replace and other
                     # changes from the update we just pulled).
@@ -4698,6 +4693,28 @@ For more help on a command:
         help="How to handle skill name conflicts (default: skip)"
     )
     claw_migrate.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Skip confirmation prompts"
+    )
+
+    # claw cleanup
+    claw_cleanup = claw_subparsers.add_parser(
+        "cleanup",
+        aliases=["clean"],
+        help="Archive leftover OpenClaw directories after migration",
+        description="Scan for and archive leftover OpenClaw directories to prevent state fragmentation"
+    )
+    claw_cleanup.add_argument(
+        "--source",
+        help="Path to a specific OpenClaw directory to clean up"
+    )
+    claw_cleanup.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview what would be archived without making changes"
+    )
+    claw_cleanup.add_argument(
         "--yes", "-y",
         action="store_true",
         help="Skip confirmation prompts"

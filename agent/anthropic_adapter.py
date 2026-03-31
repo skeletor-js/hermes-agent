@@ -162,6 +162,36 @@ def _is_oauth_token(key: str) -> bool:
     return True
 
 
+def _is_third_party_anthropic_endpoint(base_url: str | None) -> bool:
+    """Return True for non-Anthropic endpoints using the Anthropic Messages API.
+
+    Third-party proxies (Azure AI Foundry, AWS Bedrock, self-hosted) authenticate
+    with their own API keys via x-api-key, not Anthropic OAuth tokens. OAuth
+    detection should be skipped for these endpoints.
+    """
+    if not base_url:
+        return False  # No base_url = direct Anthropic API
+    normalized = base_url.rstrip("/").lower()
+    if "anthropic.com" in normalized:
+        return False  # Direct Anthropic API — OAuth applies
+    return True  # Any other endpoint is a third-party proxy
+
+
+def _requires_bearer_auth(base_url: str | None) -> bool:
+    """Return True for Anthropic-compatible providers that require Bearer auth.
+
+    Some third-party /anthropic endpoints implement Anthropic's Messages API but
+    require Authorization: Bearer instead of Anthropic's native x-api-key header.
+    MiniMax's global and China Anthropic-compatible endpoints follow this pattern.
+    """
+    if not base_url:
+        return False
+    normalized = base_url.rstrip("/").lower()
+    return normalized.startswith("https://api.minimax.io/anthropic") or normalized.startswith(
+        "https://api.minimaxi.com/anthropic"
+    )
+
+
 def build_anthropic_client(api_key: str, base_url: str = None):
     """Create an Anthropic client, auto-detecting setup-tokens vs API keys.
 
@@ -180,7 +210,25 @@ def build_anthropic_client(api_key: str, base_url: str = None):
     if base_url:
         kwargs["base_url"] = base_url
 
-    if _is_oauth_token(api_key):
+    if _requires_bearer_auth(base_url):
+        # Some Anthropic-compatible providers (e.g. MiniMax) expect the API key in
+        # Authorization: Bearer even for regular API keys. Route those endpoints
+        # through auth_token so the SDK sends Bearer auth instead of x-api-key.
+        # Check this before OAuth token shape detection because MiniMax secrets do
+        # not use Anthropic's sk-ant-api prefix and would otherwise be misread as
+        # Anthropic OAuth/setup tokens.
+        kwargs["auth_token"] = api_key
+        if _COMMON_BETAS:
+            kwargs["default_headers"] = {"anthropic-beta": ",".join(_COMMON_BETAS)}
+    elif _is_third_party_anthropic_endpoint(base_url):
+        # Third-party proxies (Azure AI Foundry, AWS Bedrock, etc.) use their
+        # own API keys with x-api-key auth. Skip OAuth detection — their keys
+        # don't follow Anthropic's sk-ant-* prefix convention and would be
+        # misclassified as OAuth tokens.
+        kwargs["api_key"] = api_key
+        if _COMMON_BETAS:
+            kwargs["default_headers"] = {"anthropic-beta": ",".join(_COMMON_BETAS)}
+    elif _is_oauth_token(api_key):
         # OAuth access token / setup-token → Bearer auth + Claude Code identity.
         # Anthropic routes OAuth requests based on user-agent and headers;
         # without Claude Code's fingerprint, requests get intermittent 500s.
@@ -313,7 +361,14 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
 
                 if new_access:
                     new_expires_ms = int(time.time() * 1000) + (expires_in * 1000)
-                    _write_claude_code_credentials(new_access, new_refresh, new_expires_ms)
+                    # Parse scopes from refresh response — Claude Code >=2.1.81
+                    # requires a "scopes" field in the credential store and checks
+                    # for "user:inference" before accepting the token as valid.
+                    scope_str = result.get("scope", "")
+                    scopes = scope_str.split() if scope_str else None
+                    _write_claude_code_credentials(
+                        new_access, new_refresh, new_expires_ms, scopes=scopes,
+                    )
                     logger.debug("Refreshed Claude Code OAuth token via %s", endpoint)
                     return new_access
         except Exception as e:
@@ -322,8 +377,20 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _write_claude_code_credentials(access_token: str, refresh_token: str, expires_at_ms: int) -> None:
-    """Write refreshed credentials back to ~/.claude/.credentials.json."""
+def _write_claude_code_credentials(
+    access_token: str,
+    refresh_token: str,
+    expires_at_ms: int,
+    *,
+    scopes: Optional[list] = None,
+) -> None:
+    """Write refreshed credentials back to ~/.claude/.credentials.json.
+
+    The optional *scopes* list (e.g. ``["user:inference", "user:profile", ...]``)
+    is persisted so that Claude Code's own auth check recognises the credential
+    as valid.  Claude Code >=2.1.81 gates on the presence of ``"user:inference"``
+    in the stored scopes before it will use the token.
+    """
     cred_path = Path.home() / ".claude" / ".credentials.json"
     try:
         # Read existing file to preserve other fields
@@ -331,11 +398,19 @@ def _write_claude_code_credentials(access_token: str, refresh_token: str, expire
         if cred_path.exists():
             existing = json.loads(cred_path.read_text(encoding="utf-8"))
 
-        existing["claudeAiOauth"] = {
+        oauth_data: Dict[str, Any] = {
             "accessToken": access_token,
             "refreshToken": refresh_token,
             "expiresAt": expires_at_ms,
         }
+        if scopes is not None:
+            oauth_data["scopes"] = scopes
+        elif "claudeAiOauth" in existing and "scopes" in existing["claudeAiOauth"]:
+            # Preserve previously-stored scopes when the refresh response
+            # does not include a scope field.
+            oauth_data["scopes"] = existing["claudeAiOauth"]["scopes"]
+
+        existing["claudeAiOauth"] = oauth_data
 
         cred_path.parent.mkdir(parents=True, exist_ok=True)
         cred_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
